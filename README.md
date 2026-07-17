@@ -12,7 +12,7 @@ every Vulkan call written by hand - no vk-bootstrap, no VMA, no engine.
 The source is heavily commented with WebGL2-to-Vulkan notes at every major
 concept.
 
-![the streamed world](docs/screenshot-world.png)
+![street level](docs/screenshot-world-close.png)
 
 ## What's inside
 
@@ -53,8 +53,6 @@ concept.
   `--radius <n>` the streaming radius. Each square is built with its eight
   neighbours as decode context, which keeps color blending and lighting
   seamless across chunk borders.
-
-![street level](docs/screenshot-world-close.png)
 
 Non-goals, kept out deliberately: animation, multiple pipelines, shadow
 mapping.
@@ -105,6 +103,9 @@ build-win\Release\xrsps-native.exe
 ```
 
 (Use `--config Debug` to run with the validation layers enabled.)
+
+`build_win.bat` does the same in one step and launches the viewer;
+arguments are passed through, e.g. `build_win.bat --world`.
 
 ### Linux
 
