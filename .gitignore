@@ -1,69 +1,16 @@
-# Prerequisites
-*.d
-
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
-*.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-*.so.*
-
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-# Build directories
-build/
-Build/
-build-*/
-
-# CMake generated files
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-install_manifest.txt
-compile_commands.json
-
-# Temporary files
-*.tmp
-*.log
-*.bak
-*.swp
-
-# vcpkg
-vcpkg_installed/
-
-# debug information files
-*.dwo
-
-# test output & cache
-Testing/
+# Build output (any configuration, e.g. build/, build-win/)
+build*/
+out/
+.vs/
+.vscode/
 .cache/
+CMakeUserPresets.json
+
+# Ad-hoc captures from --screenshot / F2 (curated ones live in docs/)
+*.ppm
+
+# Game cache data (Jagex assets - never committed; drop your own OSRS cache
+# here, e.g. from an OpenRS2 archive dump, to use --world)
+cache/
+
+STUDY.md
