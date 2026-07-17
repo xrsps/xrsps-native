@@ -58,6 +58,20 @@ const std::array<int32_t, 2048>& cosineTable() {
     return table;
 }
 
+// Same 65536-scale table for sine; animation rotations index both tables
+// with the client's ((value & 0xff) * 8) angle encoding.
+const std::array<int32_t, 2048>& sineTable() {
+    static const auto table = [] {
+        std::array<int32_t, 2048> t{};
+        for (int i = 0; i < 2048; ++i) {
+            t[static_cast<size_t>(i)] =
+                static_cast<int32_t>(65536.0 * std::sin(i * (3.141592653589793 * 2.0 / 2048.0)));
+        }
+        return t;
+    }();
+    return table;
+}
+
 int32_t interpolateCos(int32_t a, int32_t b, int32_t x, int32_t freq) {
     const int32_t t = (65536 - cosineTable()[static_cast<size_t>((x * 1024) / freq)]) >> 1;
     return ((t * b) >> 16) + (((65536 - t) * a) >> 16);
@@ -574,8 +588,8 @@ struct Cursor {
 };
 
 // Decoded subset of the classic (pre-2018) model format: geometry, face
-// colors, render types, textures. Skins/priorities are walked but dropped -
-// this viewer neither animates nor sorts.
+// colors, render types, textures, and the animation labels. Priorities are
+// walked but dropped - this viewer never depth-sorts faces.
 struct RawModel {
     int32_t vertexCount = 0;
     int32_t faceCount = 0;
@@ -585,6 +599,10 @@ struct RawModel {
     std::vector<int8_t> faceRenderTypes; // empty = all smooth
     std::vector<int8_t> faceAlphas;      // empty = opaque
     std::vector<int16_t> faceTextures;   // empty = untextured
+    // Animation labels ("skins"): each vertex/face may belong to one group;
+    // sequence frames move whole groups at a time. Empty = not animatable.
+    std::vector<int32_t> vertexSkins;
+    std::vector<int32_t> faceSkins;
     // Texture-mapping triangles: three vertex indices whose positions define
     // the texture-space origin and axes for the faces that reference them
     // (via textureCoords); 0xffff marks an unsupported projection type.
@@ -634,8 +652,6 @@ bool decodeClassicModel(const std::vector<uint8_t>& data, RawModel& out) {
     const size_t vertYOff = offset;            offset += static_cast<size_t>(vertYSize);
     const size_t vertZOff = offset;
     (void)prioritiesOff;
-    (void)faceSkinsOff;
-    (void)vertexSkinsOff;
 
     out.vertexCount = vertexCount;
     out.faceCount = faceCount;
@@ -658,6 +674,8 @@ bool decodeClassicModel(const std::vector<uint8_t>& data, RawModel& out) {
     Cursor xs(data);      xs.off = vertXOff;
     Cursor ys(data);      ys.off = vertYOff;
     Cursor zs(data);      zs.off = vertZOff;
+    Cursor vskins(data);  vskins.off = vertexSkinsOff;
+    if (hasVertexSkins == 1) out.vertexSkins.resize(static_cast<size_t>(vertexCount));
     int32_t px = 0;
     int32_t py = 0;
     int32_t pz = 0;
@@ -669,14 +687,18 @@ bool decodeClassicModel(const std::vector<uint8_t>& data, RawModel& out) {
         out.vx[static_cast<size_t>(i)] = px;
         out.vy[static_cast<size_t>(i)] = py;
         out.vz[static_cast<size_t>(i)] = pz;
+        if (hasVertexSkins == 1) out.vertexSkins[static_cast<size_t>(i)] = vskins.u8();
     }
 
-    // Face colors + optional render-type/texture flags + alphas.
+    // Face colors + optional render-type/texture flags + alphas + skins.
     Cursor colors(data); colors.off = colorsOff;
     Cursor info(data);   info.off = faceInfoOff;
     Cursor alphas(data); alphas.off = alphasOff;
+    Cursor fskins(data); fskins.off = faceSkinsOff;
+    if (hasFaceSkins == 1) out.faceSkins.resize(static_cast<size_t>(faceCount));
     for (int32_t i = 0; i < faceCount; ++i) {
         out.faceColors[static_cast<size_t>(i)] = colors.u16();
+        if (hasFaceSkins == 1) out.faceSkins[static_cast<size_t>(i)] = fskins.u8();
         if (hasFaceInfo == 1) {
             const uint8_t flag = info.u8();
             out.faceRenderTypes[static_cast<size_t>(i)] = (flag & 1) != 0 ? 1 : 0;
@@ -769,8 +791,8 @@ bool decodeV2Model(const std::vector<uint8_t>& data, RawModel& out) {
     const int32_t priorityByte = head.u8();
     const int32_t hasFaceAlphas = head.u8();
     const int32_t hasFaceSkins = head.u8();
-    head.u8(); // hasVertexSkins - inside the skins blob, skipped whole below
-    head.u8(); // hasMayaGroups  - likewise
+    const int32_t hasVertexSkins = head.u8(); // leads the skins blob below
+    head.u8(); // hasMayaGroups - trails the vertex skins, unused here
     const int32_t vertXSize = head.u16();
     const int32_t vertYSize = head.u16();
     head.u16(); // vertex Z stream size (implicit, trailing)
@@ -781,9 +803,9 @@ bool decodeV2Model(const std::vector<uint8_t>& data, RawModel& out) {
     const size_t vertexFlagsOff = offset; offset += static_cast<size_t>(vertexCount);
     const size_t faceTypesOff = offset;   offset += static_cast<size_t>(faceCount);
     if (priorityByte == 255) offset += static_cast<size_t>(faceCount);
-    if (hasFaceSkins == 1) offset += static_cast<size_t>(faceCount);
+    const size_t faceSkinsOff = offset;   if (hasFaceSkins == 1) offset += static_cast<size_t>(faceCount);
     const size_t faceInfoOff = offset;    if (hasFaceInfo == 1) offset += static_cast<size_t>(faceCount);
-    offset += static_cast<size_t>(skinsSize); // vertex skins + maya groups
+    const size_t skinsOff = offset;       offset += static_cast<size_t>(skinsSize); // vertex skins + maya groups
     const size_t alphasOff = offset;      if (hasFaceAlphas == 1) offset += static_cast<size_t>(faceCount);
     const size_t faceIndicesOff = offset; offset += static_cast<size_t>(faceIndexSize);
     const size_t colorsOff = offset;      offset += static_cast<size_t>(faceCount) * 2;
@@ -821,10 +843,12 @@ bool decodeV2Model(const std::vector<uint8_t>& data, RawModel& out) {
         }
     }
 
-    Cursor flags(data); flags.off = vertexFlagsOff;
-    Cursor xs(data);    xs.off = vertXOff;
-    Cursor ys(data);    ys.off = vertYOff;
-    Cursor zs(data);    zs.off = vertZOff;
+    Cursor flags(data);  flags.off = vertexFlagsOff;
+    Cursor xs(data);     xs.off = vertXOff;
+    Cursor ys(data);     ys.off = vertYOff;
+    Cursor zs(data);     zs.off = vertZOff;
+    Cursor vskins(data); vskins.off = skinsOff;
+    if (hasVertexSkins == 1) out.vertexSkins.resize(static_cast<size_t>(vertexCount));
     int32_t px = 0;
     int32_t py = 0;
     int32_t pz = 0;
@@ -836,13 +860,17 @@ bool decodeV2Model(const std::vector<uint8_t>& data, RawModel& out) {
         out.vx[static_cast<size_t>(i)] = px;
         out.vy[static_cast<size_t>(i)] = py;
         out.vz[static_cast<size_t>(i)] = pz;
+        if (hasVertexSkins == 1) out.vertexSkins[static_cast<size_t>(i)] = vskins.u8();
     }
 
     Cursor colors(data); colors.off = colorsOff;
     Cursor info(data);   info.off = faceInfoOff;
     Cursor alphas(data); alphas.off = alphasOff;
+    Cursor fskins(data); fskins.off = faceSkinsOff;
+    if (hasFaceSkins == 1) out.faceSkins.resize(static_cast<size_t>(faceCount));
     for (int32_t i = 0; i < faceCount; ++i) {
         out.faceColors[static_cast<size_t>(i)] = colors.u16();
+        if (hasFaceSkins == 1) out.faceSkins[static_cast<size_t>(i)] = fskins.u8();
         if (hasFaceInfo == 1) {
             const uint8_t flag = info.u8();
             out.faceRenderTypes[static_cast<size_t>(i)] = (flag & 1) != 0 ? 1 : 0;
@@ -911,8 +939,8 @@ bool decodeV3Model(const std::vector<uint8_t>& data, RawModel& out) {
     const int32_t hasFaceAlphas = head.u8();
     const int32_t hasFaceSkins = head.u8();
     const int32_t hasFaceTextures = head.u8();
-    head.u8(); // hasVertexSkins - inside the skins blob, skipped whole
-    head.u8(); // hasMayaGroups  - likewise
+    const int32_t hasVertexSkins = head.u8(); // leads the skins blob below
+    head.u8(); // hasMayaGroups - trails the vertex skins, unused here
     const int32_t vertXSize = head.u16();
     const int32_t vertYSize = head.u16();
     const int32_t vertZSize = head.u16();
@@ -936,8 +964,8 @@ bool decodeV3Model(const std::vector<uint8_t>& data, RawModel& out) {
     const size_t renderTypesOff = offset;  if (hasFaceInfo == 1) offset += static_cast<size_t>(faceCount);
     const size_t faceTypesOff = offset;    offset += static_cast<size_t>(faceCount);
     if (priorityByte == 255) offset += static_cast<size_t>(faceCount);
-    if (hasFaceSkins == 1) offset += static_cast<size_t>(faceCount);
-    offset += static_cast<size_t>(skinsSize);
+    const size_t faceSkinsOff = offset;    if (hasFaceSkins == 1) offset += static_cast<size_t>(faceCount);
+    const size_t skinsOff = offset;        offset += static_cast<size_t>(skinsSize);
     const size_t alphasOff = offset;       if (hasFaceAlphas == 1) offset += static_cast<size_t>(faceCount);
     const size_t faceIndicesOff = offset;  offset += static_cast<size_t>(faceIndexSize);
     const size_t texturesOff = offset;     if (hasFaceTextures == 1) offset += static_cast<size_t>(faceCount) * 2;
@@ -979,10 +1007,12 @@ bool decodeV3Model(const std::vector<uint8_t>& data, RawModel& out) {
         }
     }
 
-    Cursor flags(data); flags.off = static_cast<size_t>(texTriangleCount);
-    Cursor xs(data);    xs.off = vertXOff;
-    Cursor ys(data);    ys.off = vertYOff;
-    Cursor zs(data);    zs.off = vertZOff;
+    Cursor flags(data);  flags.off = static_cast<size_t>(texTriangleCount);
+    Cursor xs(data);     xs.off = vertXOff;
+    Cursor ys(data);     ys.off = vertYOff;
+    Cursor zs(data);     zs.off = vertZOff;
+    Cursor vskins(data); vskins.off = skinsOff;
+    if (hasVertexSkins == 1) out.vertexSkins.resize(static_cast<size_t>(vertexCount));
     int32_t px = 0;
     int32_t py = 0;
     int32_t pz = 0;
@@ -994,6 +1024,7 @@ bool decodeV3Model(const std::vector<uint8_t>& data, RawModel& out) {
         out.vx[static_cast<size_t>(i)] = px;
         out.vy[static_cast<size_t>(i)] = py;
         out.vz[static_cast<size_t>(i)] = pz;
+        if (hasVertexSkins == 1) out.vertexSkins[static_cast<size_t>(i)] = vskins.u8();
     }
 
     Cursor colors(data);   colors.off = colorsOff;
@@ -1001,8 +1032,11 @@ bool decodeV3Model(const std::vector<uint8_t>& data, RawModel& out) {
     Cursor alphas(data);   alphas.off = alphasOff;
     Cursor textures(data); textures.off = texturesOff;
     Cursor coords(data);   coords.off = texCoordsOff;
+    Cursor fskins(data);   fskins.off = faceSkinsOff;
+    if (hasFaceSkins == 1) out.faceSkins.resize(static_cast<size_t>(faceCount));
     for (int32_t i = 0; i < faceCount; ++i) {
         out.faceColors[static_cast<size_t>(i)] = colors.u16();
+        if (hasFaceSkins == 1) out.faceSkins[static_cast<size_t>(i)] = fskins.u8();
         if (hasFaceInfo == 1) out.faceRenderTypes[static_cast<size_t>(i)] = types.i8();
         if (hasFaceAlphas == 1) out.faceAlphas[static_cast<size_t>(i)] = alphas.i8();
         if (hasFaceTextures == 1) {
@@ -1083,6 +1117,7 @@ struct LocType {
     int32_t offsetX = 0;
     int32_t offsetHeight = 0;
     int32_t offsetY = 0;
+    int32_t seqId = -1; // looping ambient animation (fires, flags, wheels)
 };
 
 // Opcode walk for OSRS rev 220+ loc configs. Fields the viewer ignores must
@@ -1135,7 +1170,10 @@ LocType decodeLocType(const std::vector<uint8_t>& data) {
             case 17: case 18: break;
             case 19: r.u8(); break;
             case 21: case 22: case 23: break;
-            case 24: r.u16(); break;
+            case 24:
+                type.seqId = r.u16();
+                if (type.seqId == 0xffff) type.seqId = -1;
+                break;
             case 25: case 27: break;
             case 28: r.u8(); break;
             case 29: type.ambient = r.i8(); break;
@@ -1252,6 +1290,335 @@ void decodeLocPlacements(const std::vector<uint8_t>& data, int offsetX, int offs
     }
 }
 
+// ============================================================================
+// Loc animation: seq configs, transform bases (framemaps), and frames.
+//
+// A seq config (config group 12) lists frame ids and per-frame durations in
+// client ticks (20 ms). Each frame (index 0, group = id >> 16, file =
+// id & 0xffff) references a base (index 1) that declares transform groups -
+// each an operation type plus the vertex/face labels it drives - and stores
+// per-group translate/rotate/scale/alpha values. Animating a model is:
+// walk the frame's transforms, move whole label groups at a time, using the
+// client's exact fixed-point arithmetic.
+// ============================================================================
+
+constexpr int kFramesIndex = 0; // animation frames
+constexpr int kBasesIndex = 1;  // transform bases (framemaps)
+constexpr int kSeqsGroup = 12;  // config group 12: seq definitions
+
+// Transform group operation types.
+constexpr int32_t kSeqOrigin = 0;
+constexpr int32_t kSeqTranslate = 1;
+constexpr int32_t kSeqRotate = 2;
+constexpr int32_t kSeqScale = 3;
+constexpr int32_t kSeqAlpha = 5;
+
+struct SeqBaseType {
+    std::vector<int32_t> types;                 // one op type per group
+    std::vector<std::vector<int32_t>> labels;   // labels each group drives
+};
+
+SeqBaseType decodeSeqBase(const std::vector<uint8_t>& data) {
+    SeqBaseType base;
+    Cursor r(data);
+    const int count = r.u8();
+    base.types.resize(static_cast<size_t>(count));
+    base.labels.resize(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        base.types[static_cast<size_t>(i)] = r.u8();
+        // Type 6 is an alias for rotate in current caches.
+        if (base.types[static_cast<size_t>(i)] == 6) {
+            base.types[static_cast<size_t>(i)] = kSeqRotate;
+        }
+    }
+    for (int i = 0; i < count; ++i) {
+        base.labels[static_cast<size_t>(i)].resize(r.u8());
+    }
+    for (int i = 0; i < count; ++i) {
+        for (int32_t& label : base.labels[static_cast<size_t>(i)]) label = r.u8();
+    }
+    // A skeletal-bones blob may trail; this viewer only plays frame-based
+    // seqs (which is what world locs use), so it is left unread.
+    return base;
+}
+
+struct SeqFrameDef {
+    int32_t baseId = -1;
+    std::vector<int32_t> groups;      // indices into the base's group list
+    std::vector<int32_t> dx, dy, dz;  // per-transform values
+    // Base group whose ORIGIN must be re-applied (with a zero offset)
+    // before this transform, or -1. Covers origin groups whose own value
+    // stream was omitted from the frame.
+    std::vector<int32_t> resetOrigin;
+    bool hasAlphaTransform = false;
+};
+
+bool decodeSeqFrame(const std::vector<uint8_t>& data, const SeqBaseType& base,
+                    SeqFrameDef& out) {
+    if (data.size() < 3) return false;
+    Cursor flags(data);
+    flags.off = 2; // the caller already peeked the base id
+    const int count = flags.u8();
+    if (static_cast<size_t>(count) > base.types.size()) return false;
+    Cursor values(data);
+    values.off = 3 + static_cast<size_t>(count);
+
+    int32_t resetGroup = -1;
+    int32_t lastResetGroup = -1;
+    for (int i = 0; i < count; ++i) {
+        const int32_t type = base.types[static_cast<size_t>(i)];
+        if (type == kSeqOrigin) resetGroup = i;
+
+        const uint8_t flag = flags.u8();
+        if (flag == 0) continue;
+        if (type == kSeqOrigin) lastResetGroup = i;
+
+        const int32_t defaultValue = (type == kSeqScale || type == 10) ? 128 : 0;
+        const int32_t x = (flag & 1) != 0 ? values.smart2() : defaultValue;
+        const int32_t y = (flag & 2) != 0 ? values.smart2() : defaultValue;
+        const int32_t z = (flag & 4) != 0 ? values.smart2() : defaultValue;
+
+        int32_t reset = -1;
+        if (type == kSeqTranslate || type == kSeqRotate || type == kSeqScale) {
+            if (resetGroup > lastResetGroup) {
+                reset = resetGroup;
+                lastResetGroup = resetGroup;
+            }
+        } else if (type == kSeqAlpha) {
+            out.hasAlphaTransform = true;
+        }
+
+        out.groups.push_back(i);
+        out.dx.push_back(x);
+        out.dy.push_back(y);
+        out.dz.push_back(z);
+        out.resetOrigin.push_back(reset);
+    }
+    return true;
+}
+
+struct SeqDef {
+    std::vector<int32_t> frameIds;     // (frame group << 16) | file
+    std::vector<int32_t> frameLengths; // client ticks (20 ms each)
+};
+
+// Opcode walk for OSRS rev 226+ seq configs. As with locs, fields the
+// viewer ignores must still be consumed exactly.
+SeqDef decodeSeqDef(const std::vector<uint8_t>& data) {
+    SeqDef seq;
+    Cursor r(data);
+    while (r.off < r.n) {
+        const uint8_t opcode = r.u8();
+        if (opcode == 0) break;
+        switch (opcode) {
+            case 1: {
+                const int count = r.u16();
+                seq.frameLengths.resize(static_cast<size_t>(count));
+                seq.frameIds.resize(static_cast<size_t>(count));
+                for (int i = 0; i < count; ++i) {
+                    seq.frameLengths[static_cast<size_t>(i)] = r.u16();
+                }
+                for (int i = 0; i < count; ++i) {
+                    seq.frameIds[static_cast<size_t>(i)] = r.u16();
+                }
+                for (int i = 0; i < count; ++i) {
+                    seq.frameIds[static_cast<size_t>(i)] +=
+                        static_cast<int32_t>(r.u16()) << 16;
+                }
+                break;
+            }
+            case 2: r.u16(); break; // frame step
+            case 3: {
+                const int count = r.u8();
+                for (int i = 0; i < count; ++i) r.u8();
+                break;
+            }
+            case 4: break;
+            case 5: r.u8(); break;
+            case 6: case 7: r.u16(); break;
+            case 8: case 9: case 10: case 11: r.u8(); break;
+            case 12: {
+                const int count = r.u8();
+                for (int i = 0; i < 2 * count; ++i) r.u16();
+                break;
+            }
+            case 13: r.i32(); break; // skeletal seq id
+            case 14: {
+                const int entries = r.u16();
+                for (int i = 0; i < entries; ++i) {
+                    r.u16(); // frame
+                    r.u16(); // sound id
+                    r.u8();  // weight
+                    r.u8();  // loops
+                    r.u8();  // location
+                    r.u8();  // attenuation
+                }
+                break;
+            }
+            case 15: r.u16(); r.u16(); break;
+            case 16: r.u8(); break;
+            case 17: {
+                const int count = r.u8();
+                for (int i = 0; i < count; ++i) r.u8();
+                break;
+            }
+            case 18: r.skipString(); break;
+            case 19: break;
+            case 100: {
+                const int count = r.u8();
+                for (int i = 0; i < 2 * count; ++i) r.u16();
+                break;
+            }
+            default:
+                // Unknown opcode: cannot resync, keep what we have.
+                return seq;
+        }
+    }
+    return seq;
+}
+
+// Applies one animation frame to a copy of a model's vertices (and face
+// alphas). This is the client's Model.transform(): ORIGIN computes a pivot
+// as the truncated average of a label group, TRANSLATE/ROTATE/SCALE move
+// label groups about it in 16.16 fixed point, ALPHA fades face groups.
+void applySeqFrame(const SeqFrameDef& frame, const SeqBaseType& base,
+                   const std::vector<std::vector<int32_t>>& vertexGroups,
+                   const std::vector<std::vector<int32_t>>& faceGroups,
+                   std::vector<int32_t>& vx, std::vector<int32_t>& vy,
+                   std::vector<int32_t>& vz, std::vector<int32_t>& faceAlphas) {
+    int32_t originX = 0;
+    int32_t originY = 0;
+    int32_t originZ = 0;
+
+    auto apply = [&](int32_t type, const std::vector<int32_t>& labels, int32_t tx,
+                     int32_t ty, int32_t tz) {
+        switch (type) {
+            case kSeqOrigin: {
+                int64_t sumX = 0;
+                int64_t sumY = 0;
+                int64_t sumZ = 0;
+                int64_t count = 0;
+                for (const int32_t label : labels) {
+                    if (static_cast<size_t>(label) >= vertexGroups.size()) continue;
+                    for (const int32_t v : vertexGroups[static_cast<size_t>(label)]) {
+                        sumX += vx[static_cast<size_t>(v)];
+                        sumY += vy[static_cast<size_t>(v)];
+                        sumZ += vz[static_cast<size_t>(v)];
+                        ++count;
+                    }
+                }
+                if (count > 0) {
+                    originX = tx + static_cast<int32_t>(sumX / count);
+                    originY = ty + static_cast<int32_t>(sumY / count);
+                    originZ = tz + static_cast<int32_t>(sumZ / count);
+                } else {
+                    originX = tx;
+                    originY = ty;
+                    originZ = tz;
+                }
+                break;
+            }
+            case kSeqTranslate:
+                for (const int32_t label : labels) {
+                    if (static_cast<size_t>(label) >= vertexGroups.size()) continue;
+                    for (const int32_t v : vertexGroups[static_cast<size_t>(label)]) {
+                        vx[static_cast<size_t>(v)] += tx;
+                        vy[static_cast<size_t>(v)] += ty;
+                        vz[static_cast<size_t>(v)] += tz;
+                    }
+                }
+                break;
+            case kSeqRotate: {
+                // 2048-step circle, 8 units per encoded step; roll (Z),
+                // then pitch (X), then yaw (Y), all about the origin group.
+                const int32_t angleX = (tx & 0xff) * 8;
+                const int32_t angleY = (ty & 0xff) * 8;
+                const int32_t angleZ = (tz & 0xff) * 8;
+                const auto& sine = sineTable();
+                const auto& cosine = cosineTable();
+                auto rot = [](int32_t sin, int32_t cos, int32_t a, int32_t b) {
+                    return static_cast<int32_t>(
+                        (static_cast<int64_t>(sin) * a + static_cast<int64_t>(cos) * b) >>
+                        16);
+                };
+                for (const int32_t label : labels) {
+                    if (static_cast<size_t>(label) >= vertexGroups.size()) continue;
+                    for (const int32_t v : vertexGroups[static_cast<size_t>(label)]) {
+                        const size_t i = static_cast<size_t>(v);
+                        int32_t x = vx[i] - originX;
+                        int32_t y = vy[i] - originY;
+                        int32_t z = vz[i] - originZ;
+                        if (angleZ != 0) {
+                            const int32_t s = sine[static_cast<size_t>(angleZ)];
+                            const int32_t c = cosine[static_cast<size_t>(angleZ)];
+                            const int32_t t = rot(s, c, y, x);
+                            y = rot(-s, c, x, y);
+                            x = t;
+                        }
+                        if (angleX != 0) {
+                            const int32_t s = sine[static_cast<size_t>(angleX)];
+                            const int32_t c = cosine[static_cast<size_t>(angleX)];
+                            const int32_t t = rot(-s, c, z, y);
+                            z = rot(s, c, y, z);
+                            y = t;
+                        }
+                        if (angleY != 0) {
+                            const int32_t s = sine[static_cast<size_t>(angleY)];
+                            const int32_t c = cosine[static_cast<size_t>(angleY)];
+                            const int32_t t = rot(s, c, z, x);
+                            z = rot(-s, c, x, z);
+                            x = t;
+                        }
+                        vx[i] = x + originX;
+                        vy[i] = y + originY;
+                        vz[i] = z + originZ;
+                    }
+                }
+                break;
+            }
+            case kSeqScale:
+                for (const int32_t label : labels) {
+                    if (static_cast<size_t>(label) >= vertexGroups.size()) continue;
+                    for (const int32_t v : vertexGroups[static_cast<size_t>(label)]) {
+                        const size_t i = static_cast<size_t>(v);
+                        vx[i] = static_cast<int32_t>(
+                                    static_cast<int64_t>(tx) * (vx[i] - originX) / 128) +
+                                originX;
+                        vy[i] = static_cast<int32_t>(
+                                    static_cast<int64_t>(ty) * (vy[i] - originY) / 128) +
+                                originY;
+                        vz[i] = static_cast<int32_t>(
+                                    static_cast<int64_t>(tz) * (vz[i] - originZ) / 128) +
+                                originZ;
+                    }
+                }
+                break;
+            case kSeqAlpha:
+                for (const int32_t label : labels) {
+                    if (static_cast<size_t>(label) >= faceGroups.size()) continue;
+                    for (const int32_t f : faceGroups[static_cast<size_t>(label)]) {
+                        faceAlphas[static_cast<size_t>(f)] = std::clamp(
+                            faceAlphas[static_cast<size_t>(f)] + tx * 8, 0, 255);
+                    }
+                }
+                break;
+            default:
+                break; // LIGHT and skeletal-only types: not used by world locs
+        }
+    };
+
+    for (size_t i = 0; i < frame.groups.size(); ++i) {
+        if (frame.resetOrigin[i] != -1) {
+            apply(kSeqOrigin, base.labels[static_cast<size_t>(frame.resetOrigin[i])], 0,
+                  0, 0);
+        }
+        const size_t group = static_cast<size_t>(frame.groups[i]);
+        if (group >= base.types.size()) continue;
+        apply(base.types[group], base.labels[group], frame.dx[i], frame.dy[i],
+              frame.dz[i]);
+    }
+}
+
 // What the scene builder knows about one game texture.
 struct TextureInfo {
     int32_t avgHsl = 0;  // packed HSL average, the minimap substitute
@@ -1352,6 +1719,10 @@ struct LitModel {
     std::vector<int32_t> hsls;         // 3 per face
     std::vector<glm::vec2> uvs;        // 3 per face
     std::vector<int32_t> layers;       // 1 per face, -1 = untextured
+    std::vector<uint8_t> alphas;       // 1 per face, 0 opaque .. 255 invisible
+    std::vector<glm::ivec3> corners;   // 1 per face: source vertex indices, so
+                                       // animation can re-derive positions
+    std::vector<int32_t> faces;        // 1 per face: source RawModel face index
 };
 
 // UVs for one textured face. The model format expresses texture space as a
@@ -1415,9 +1786,12 @@ void computeFaceUvs(const RawModel& raw, int32_t face, glm::vec2 outUv[3]) {
 // vertex normals accumulate face normals of smooth faces; each vertex color
 // is the face's palette HSL with its lightness scaled by ambient + N.L.
 // Flat-shaded faces (render type 1) use the face normal for all corners.
+// `keepHiddenFaces` retains alpha-255 (invisible) faces in the output -
+// animated models need them resident because an ALPHA transform may fade
+// them in at some frame.
 void lightModel(const RawModel& raw, int32_t ambient, int32_t contrast,
                 const std::unordered_map<int32_t, TextureInfo>& textureInfo,
-                LitModel& out) {
+                LitModel& out, bool keepHiddenFaces = false) {
     const int32_t lightX = -50;
     const int32_t lightY = -10;
     const int32_t lightZ = -50;
@@ -1480,10 +1854,11 @@ void lightModel(const RawModel& raw, int32_t ambient, int32_t contrast,
 
     for (int32_t i = 0; i < raw.faceCount; ++i) {
         const size_t fi = static_cast<size_t>(i);
-        const int8_t alpha = raw.faceAlphas.empty() ? int8_t{0} : raw.faceAlphas[fi];
+        const int32_t alpha =
+            raw.faceAlphas.empty() ? 0 : (raw.faceAlphas[fi] & 0xff);
         int32_t type = raw.faceRenderTypes.empty() ? 0 : raw.faceRenderTypes[fi];
-        if (alpha == -1) continue; // fully transparent
-        if (alpha == -2) type = 3;
+        if (alpha == 255 && !keepHiddenFaces) continue; // fully transparent
+        if (alpha == 254) type = 3;                     // forced solid black
 
         const int32_t texture = raw.faceTextures.empty() ? -1 : raw.faceTextures[fi];
         const int32_t color = raw.faceColors[fi] & 0xffff;
@@ -1553,6 +1928,9 @@ void lightModel(const RawModel& raw, int32_t ambient, int32_t contrast,
         out.uvs.push_back(uv[1]);
         out.uvs.push_back(uv[2]);
         out.layers.push_back(layer);
+        out.alphas.push_back(static_cast<uint8_t>(alpha == 254 ? 0 : alpha));
+        out.corners.push_back({a, b, c});
+        out.faces.push_back(i);
     }
 }
 
@@ -1564,10 +1942,13 @@ float srgbToLinear(int32_t channel) {
 // Emits one lit, palette-resolved triangle into the model (viewer space:
 // 1 unit = 1 tile, +Y up, -Z north). Terrain colors arrive fully lit, so
 // vertices carry a flat up normal and the renderer draws them unlit.
+// `alpha` is the game's face transparency byte (0 opaque .. 255 invisible);
+// nonzero values route the triangle into the model's blended index list.
 void emitTriangle(Model& model, const std::vector<int32_t>& palette,
                   const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
                   int32_t hslA, int32_t hslB, int32_t hslC, bool reorientUp,
-                  const glm::vec2* uvs = nullptr, int32_t layer = -1) {
+                  const glm::vec2* uvs = nullptr, int32_t layer = -1,
+                  int32_t alpha = 0) {
     // Untextured: the packed HSL resolves through the game palette.
     // Textured: the "hsl" is a bare lightness (2..126); the texture supplies
     // color at sampling time, so the vertex color becomes a gray multiplier.
@@ -1581,12 +1962,17 @@ void emitTriangle(Model& model, const std::vector<int32_t>& palette,
                          srgbToLinear(rgb & 0xff));
     };
 
+    // The client blends with a (256 - alpha)/256 source weight; the same
+    // curve lands in the color's alpha channel here.
+    const float opacity =
+        static_cast<float>(255 - std::clamp(alpha, 0, 255)) / 255.0f;
+
     glm::vec3 v0 = a;
     glm::vec3 v1 = b;
     glm::vec3 v2 = c;
-    glm::vec3 col0 = toColor(hslA);
-    glm::vec3 col1 = toColor(hslB);
-    glm::vec3 col2 = toColor(hslC);
+    glm::vec4 col0(toColor(hslA), opacity);
+    glm::vec4 col1(toColor(hslB), opacity);
+    glm::vec4 col2(toColor(hslC), opacity);
     glm::vec3 uv0(0.0f, 0.0f, -1.0f);
     glm::vec3 uv1 = uv0;
     glm::vec3 uv2 = uv0;
@@ -1611,9 +1997,10 @@ void emitTriangle(Model& model, const std::vector<int32_t>& palette,
     model.vertices.push_back({v0, up, col0, uv0});
     model.vertices.push_back({v1, up, col1, uv1});
     model.vertices.push_back({v2, up, col2, uv2});
-    model.indices.push_back(base);
-    model.indices.push_back(base + 1);
-    model.indices.push_back(base + 2);
+    std::vector<uint32_t>& indices = alpha > 0 ? model.alphaIndices : model.indices;
+    indices.push_back(base);
+    indices.push_back(base + 1);
+    indices.push_back(base + 2);
 }
 
 } // namespace
@@ -1636,15 +2023,98 @@ struct WorldStreamer::Impl {
     std::unordered_map<int64_t, LitModel> litCache;
     size_t skippedModels = 0;
 
+    // Animation data, decoded lazily: seq configs (raw file per id), bases,
+    // frames (whole frame group decoded on first touch), and the per-loc
+    // pre-built animation frames shared by every placement of that loc.
+    std::unordered_map<int32_t, std::vector<uint8_t>> seqConfigFiles;
+    std::unordered_map<int32_t, SeqDef> seqDefs;
+    std::unordered_map<int32_t, SeqBaseType> seqBases;
+    std::unordered_map<int32_t, SeqFrameDef> seqFrames; // baseId -1 = known bad
+    struct AnimEntry {
+        std::vector<LitModel> frames;         // empty = loc is not animatable
+        std::vector<uint32_t> frameLengthsMs;
+    };
+    std::unordered_map<int64_t, AnimEntry> animCache;
+
     void open(const std::string& cachePath);
     int32_t terrainGroupId(int mapX, int mapY);
-    bool buildSquare(int mapX, int mapY, Model& out);
+    bool buildSquare(int mapX, int mapY, Model& out,
+                     std::vector<AnimatedGeometry>& animatedOut);
+
+    bool buildMergedModel(const std::vector<int32_t>& modelIds, const LocType& type,
+                          RawModel& merged);
+    const SeqDef* seqDef(int32_t id);
+    const SeqBaseType* seqBase(int32_t id);
+    const SeqFrameDef* seqFrame(int32_t frameId);
+    const AnimEntry& animEntry(int64_t key, const std::vector<int32_t>& modelIds,
+                               const LocType& type);
 
     const UnderlayType& underlay(int32_t id) const {
         auto it = underlayTypes.find(id);
         return it == underlayTypes.end() ? defaultUnderlay : it->second;
     }
 };
+
+const SeqDef* WorldStreamer::Impl::seqDef(int32_t id) {
+    if (id < 0) return nullptr;
+    auto it = seqDefs.find(id);
+    if (it == seqDefs.end()) {
+        auto fileIt = seqConfigFiles.find(id);
+        if (fileIt == seqConfigFiles.end()) return nullptr;
+        SeqDef seq;
+        try {
+            seq = decodeSeqDef(fileIt->second);
+        } catch (const std::exception&) {
+            seq = SeqDef{};
+        }
+        it = seqDefs.emplace(id, std::move(seq)).first;
+    }
+    return &it->second;
+}
+
+const SeqBaseType* WorldStreamer::Impl::seqBase(int32_t id) {
+    if (id < 0) return nullptr;
+    auto it = seqBases.find(id);
+    if (it == seqBases.end()) {
+        SeqBaseType base;
+        try {
+            auto files = cache.readGroupFiles(kBasesIndex, id);
+            if (files.empty()) return nullptr;
+            base = decodeSeqBase(files.begin()->second);
+        } catch (const std::exception&) {
+            return nullptr;
+        }
+        it = seqBases.emplace(id, std::move(base)).first;
+    }
+    return &it->second;
+}
+
+const SeqFrameDef* WorldStreamer::Impl::seqFrame(int32_t frameId) {
+    auto it = seqFrames.find(frameId);
+    if (it == seqFrames.end()) {
+        // Frames arrive one group per animation; decode the whole group at
+        // once so sibling frames are single lookups later.
+        const int32_t group = frameId >> 16;
+        try {
+            for (const auto& [fileId, data] : cache.readGroupFiles(kFramesIndex, group)) {
+                if (data.size() < 3) continue;
+                SeqFrameDef def;
+                def.baseId = (static_cast<int32_t>(data[0]) << 8) | data[1];
+                const SeqBaseType* base = seqBase(def.baseId);
+                if (base == nullptr || !decodeSeqFrame(data, *base, def)) continue;
+                seqFrames.emplace((group << 16) | fileId, std::move(def));
+            }
+        } catch (const std::exception&) {
+        }
+        it = seqFrames.find(frameId);
+        if (it == seqFrames.end()) {
+            // Negative-cache the miss so a broken group is not re-read for
+            // every placement that references it.
+            it = seqFrames.emplace(frameId, SeqFrameDef{}).first;
+        }
+    }
+    return it->second.baseId >= 0 ? &it->second : nullptr;
+}
 
 void WorldStreamer::Impl::open(const std::string& cachePath) {
     cache.open(cachePath);
@@ -1666,6 +2136,14 @@ void WorldStreamer::Impl::open(const std::string& cachePath) {
 
     for (const auto& [fileId, data] : cache.readGroupFiles(kConfigsIndex, 6)) {
         locTypes.emplace(fileId, decodeLocType(data));
+    }
+
+    // Seq configs stay raw here and decode on first use - only the seqs
+    // that placed locs actually reference are ever touched.
+    try {
+        seqConfigFiles = cache.readGroupFiles(kConfigsIndex, kSeqsGroup);
+    } catch (const std::exception&) {
+        // No seq configs: locs simply render un-animated.
     }
 
     // Texture definitions (simplified format, rev 233+: u16 sprite id,
@@ -1712,7 +2190,204 @@ int32_t WorldStreamer::Impl::terrainGroupId(int mapX, int mapY) {
     return cache.table(kMapsIndex).group(regionId) != nullptr ? regionId : -1;
 }
 
-bool WorldStreamer::Impl::buildSquare(int mapX, int mapY, Model& out) {
+// Decodes and merges a loc's model list into one RawModel, applying the
+// config's recolors/retextures. Returns false if nothing decoded.
+bool WorldStreamer::Impl::buildMergedModel(const std::vector<int32_t>& modelIds,
+                                           const LocType& type, RawModel& merged) {
+    for (const int32_t modelId : modelIds) {
+        try {
+            auto files = cache.readGroupFiles(7, modelId);
+            if (files.empty()) continue;
+            RawModel part;
+            if (!decodeModel(files.begin()->second, part)) {
+                ++skippedModels; // unported format variant
+                continue;
+            }
+            const int32_t vertexBase = merged.vertexCount;
+            const int32_t texBase = merged.texTriangleCount;
+            merged.vertexCount += part.vertexCount;
+            merged.vx.insert(merged.vx.end(), part.vx.begin(), part.vx.end());
+            merged.vy.insert(merged.vy.end(), part.vy.begin(), part.vy.end());
+            merged.vz.insert(merged.vz.end(), part.vz.begin(), part.vz.end());
+            // Per-vertex/per-face optional streams must stay aligned across
+            // the merge: if either side has one, pad the elements merged so
+            // far with defaults, then append this part's values.
+            const bool needVertexSkins =
+                !part.vertexSkins.empty() || !merged.vertexSkins.empty();
+            if (needVertexSkins) {
+                merged.vertexSkins.resize(static_cast<size_t>(vertexBase), -1);
+                if (part.vertexSkins.empty()) {
+                    merged.vertexSkins.insert(merged.vertexSkins.end(),
+                                              static_cast<size_t>(part.vertexCount), -1);
+                } else {
+                    merged.vertexSkins.insert(merged.vertexSkins.end(),
+                                              part.vertexSkins.begin(),
+                                              part.vertexSkins.end());
+                }
+            }
+            const bool needTypes =
+                !part.faceRenderTypes.empty() || !merged.faceRenderTypes.empty();
+            const bool needAlphas =
+                !part.faceAlphas.empty() || !merged.faceAlphas.empty();
+            const bool needTextures =
+                !part.faceTextures.empty() || !merged.faceTextures.empty();
+            const bool needCoords =
+                !part.textureCoords.empty() || !merged.textureCoords.empty();
+            const bool needFaceSkins =
+                !part.faceSkins.empty() || !merged.faceSkins.empty();
+            if (needTypes) merged.faceRenderTypes.resize(static_cast<size_t>(merged.faceCount), 0);
+            if (needAlphas) merged.faceAlphas.resize(static_cast<size_t>(merged.faceCount), 0);
+            if (needTextures) merged.faceTextures.resize(static_cast<size_t>(merged.faceCount), -1);
+            if (needCoords) merged.textureCoords.resize(static_cast<size_t>(merged.faceCount), -1);
+            if (needFaceSkins) merged.faceSkins.resize(static_cast<size_t>(merged.faceCount), -1);
+            for (int32_t f = 0; f < part.faceCount; ++f) {
+                const size_t pf = static_cast<size_t>(f);
+                merged.ia.push_back(part.ia[pf] + vertexBase);
+                merged.ib.push_back(part.ib[pf] + vertexBase);
+                merged.ic.push_back(part.ic[pf] + vertexBase);
+                merged.faceColors.push_back(part.faceColors[pf]);
+                if (needTypes) {
+                    merged.faceRenderTypes.push_back(
+                        part.faceRenderTypes.empty() ? 0 : part.faceRenderTypes[pf]);
+                }
+                if (needAlphas) {
+                    merged.faceAlphas.push_back(
+                        part.faceAlphas.empty() ? 0 : part.faceAlphas[pf]);
+                }
+                if (needTextures) {
+                    merged.faceTextures.push_back(
+                        part.faceTextures.empty() ? int16_t{-1} : part.faceTextures[pf]);
+                }
+                if (needCoords) {
+                    int8_t coord =
+                        part.textureCoords.empty() ? int8_t{-1} : part.textureCoords[pf];
+                    if (coord != -1) {
+                        // Coord indices are per-part; rebase them.
+                        const int32_t rebased = (coord & 0xff) + texBase;
+                        coord = rebased <= 127 ? static_cast<int8_t>(rebased)
+                                               : int8_t{-1};
+                    }
+                    merged.textureCoords.push_back(coord);
+                }
+                if (needFaceSkins) {
+                    merged.faceSkins.push_back(
+                        part.faceSkins.empty() ? -1 : part.faceSkins[pf]);
+                }
+            }
+            merged.faceCount += part.faceCount;
+            // Texture-mapping triangles reference part-local vertices.
+            for (int32_t t = 0; t < part.texTriangleCount; ++t) {
+                const size_t pt = static_cast<size_t>(t);
+                const bool valid = part.texP[pt] != 0xffff;
+                merged.texP.push_back(valid ? static_cast<uint16_t>(part.texP[pt] + vertexBase) : uint16_t{0xffff});
+                merged.texM.push_back(valid ? static_cast<uint16_t>(part.texM[pt] + vertexBase) : uint16_t{0xffff});
+                merged.texN.push_back(valid ? static_cast<uint16_t>(part.texN[pt] + vertexBase) : uint16_t{0xffff});
+            }
+            merged.texTriangleCount += part.texTriangleCount;
+        } catch (const std::exception&) {
+            ++skippedModels;
+        }
+    }
+
+    for (const auto& [from, to] : type.recolor) {
+        for (uint16_t& color : merged.faceColors) {
+            if (color == from) color = to;
+        }
+    }
+    for (const auto& [from, to] : type.retexture) {
+        for (int16_t& texture : merged.faceTextures) {
+            if (texture == static_cast<int16_t>(from)) {
+                texture = static_cast<int16_t>(to);
+            }
+        }
+    }
+    return merged.faceCount > 0;
+}
+
+// Builds (and caches) the per-animation-frame lit geometry for one loc.
+// Empty frames mean "render it static": no seq config, no vertex labels,
+// or a frame that failed to decode.
+const WorldStreamer::Impl::AnimEntry& WorldStreamer::Impl::animEntry(
+    int64_t key, const std::vector<int32_t>& modelIds, const LocType& type) {
+    auto it = animCache.find(key);
+    if (it != animCache.end()) return it->second;
+
+    AnimEntry entry;
+    const SeqDef* seq = seqDef(type.seqId);
+    RawModel merged;
+    if (seq != nullptr && !seq->frameIds.empty() &&
+        buildMergedModel(modelIds, type, merged) && !merged.vertexSkins.empty()) {
+        // Light once, in the neutral pose - the client keeps these colors
+        // across every animation frame (animation moves vertices, never
+        // re-lights). Hidden faces stay resident for alpha fade-ins.
+        LitModel lit;
+        lightModel(merged, 64 + type.ambient, 768 + type.contrast, textureInfo, lit,
+                   /*keepHiddenFaces=*/true);
+        if (!lit.positions.empty()) {
+            // Label -> members tables (labels are single bytes).
+            std::vector<std::vector<int32_t>> vertexGroups(256);
+            std::vector<std::vector<int32_t>> faceGroups(256);
+            for (int32_t v = 0; v < merged.vertexCount; ++v) {
+                const int32_t label = merged.vertexSkins[static_cast<size_t>(v)];
+                if (label >= 0 && label < 256) {
+                    vertexGroups[static_cast<size_t>(label)].push_back(v);
+                }
+            }
+            if (!merged.faceSkins.empty()) {
+                for (int32_t f = 0; f < merged.faceCount; ++f) {
+                    const int32_t label = merged.faceSkins[static_cast<size_t>(f)];
+                    if (label >= 0 && label < 256) {
+                        faceGroups[static_cast<size_t>(label)].push_back(f);
+                    }
+                }
+            }
+            std::vector<int32_t> baseAlphas(static_cast<size_t>(merged.faceCount), 0);
+            for (size_t f = 0; f < merged.faceAlphas.size(); ++f) {
+                baseAlphas[f] = merged.faceAlphas[f] & 0xff;
+            }
+
+            bool ok = true;
+            for (size_t f = 0; f < seq->frameIds.size(); ++f) {
+                const SeqFrameDef* frame = seqFrame(seq->frameIds[f]);
+                const SeqBaseType* base =
+                    frame != nullptr ? seqBase(frame->baseId) : nullptr;
+                if (frame == nullptr || base == nullptr) {
+                    ok = false;
+                    break;
+                }
+                std::vector<int32_t> vx = merged.vx;
+                std::vector<int32_t> vy = merged.vy;
+                std::vector<int32_t> vz = merged.vz;
+                std::vector<int32_t> alphas = baseAlphas;
+                applySeqFrame(*frame, *base, vertexGroups, faceGroups, vx, vy, vz,
+                              alphas);
+
+                LitModel frameLit = lit;
+                for (size_t i = 0; i < lit.corners.size(); ++i) {
+                    const glm::ivec3 c = lit.corners[i];
+                    frameLit.positions[i * 3 + 0] = {vx[c.x], vy[c.x], vz[c.x]};
+                    frameLit.positions[i * 3 + 1] = {vx[c.y], vy[c.y], vz[c.y]};
+                    frameLit.positions[i * 3 + 2] = {vx[c.z], vy[c.z], vz[c.z]};
+                    if (frame->hasAlphaTransform) {
+                        frameLit.alphas[i] = static_cast<uint8_t>(
+                            alphas[static_cast<size_t>(lit.faces[i])]);
+                    }
+                }
+                entry.frames.push_back(std::move(frameLit));
+                const int32_t ticks =
+                    f < seq->frameLengths.size() ? seq->frameLengths[f] : 1;
+                // Frame lengths are client ticks, 20 ms each.
+                entry.frameLengthsMs.push_back(
+                    static_cast<uint32_t>(std::max(ticks, 1)) * 20u);
+            }
+            if (!ok) entry = AnimEntry{};
+        }
+    }
+    return animCache.emplace(key, std::move(entry)).first->second;
+}
+
+bool WorldStreamer::Impl::buildSquare(int mapX, int mapY, Model& out,
+                                      std::vector<AnimatedGeometry>& animatedOut) {
     if (terrainGroupId(mapX, mapY) == -1) return false;
 
     // Decode the square plus its 8 neighbours: the blend kernel (radius 5)
@@ -2033,6 +2708,9 @@ bool WorldStreamer::Impl::buildSquare(int mapX, int mapY, Model& out) {
         return scene.get(scene.heights, level, x, y);
     };
 
+    // Animated placements grouped per loc type: cache key -> animatedOut index.
+    std::unordered_map<int64_t, size_t> animGroups;
+
     for (const LocPlacement& placement : placements) {
         auto typeIt = locTypes.find(placement.id);
         if (typeIt == locTypes.end()) continue;
@@ -2056,109 +2734,6 @@ bool WorldStreamer::Impl::buildSquare(int mapX, int mapY, Model& out) {
             }
         }
         if (modelIds == nullptr || modelIds->empty()) continue;
-
-        // Decode + light once per (loc, shape), across all squares.
-        const int64_t cacheKey = static_cast<int64_t>(placement.id) * 64 + placement.shape;
-        auto litIt = litCache.find(cacheKey);
-        if (litIt == litCache.end()) {
-            RawModel merged;
-            for (const int32_t modelId : *modelIds) {
-                try {
-                    auto files = cache.readGroupFiles(7, modelId);
-                    if (files.empty()) continue;
-                    RawModel part;
-                    if (!decodeModel(files.begin()->second, part)) {
-                        ++skippedModels; // unported format variant
-                        continue;
-                    }
-                    const int32_t vertexBase = merged.vertexCount;
-                    const int32_t texBase = merged.texTriangleCount;
-                    merged.vertexCount += part.vertexCount;
-                    merged.vx.insert(merged.vx.end(), part.vx.begin(), part.vx.end());
-                    merged.vy.insert(merged.vy.end(), part.vy.begin(), part.vy.end());
-                    merged.vz.insert(merged.vz.end(), part.vz.begin(), part.vz.end());
-                    // Per-face optional streams must stay aligned across the
-                    // merge: if either side has one, pad the faces merged so
-                    // far with defaults, then append this part's values.
-                    const bool needTypes =
-                        !part.faceRenderTypes.empty() || !merged.faceRenderTypes.empty();
-                    const bool needAlphas =
-                        !part.faceAlphas.empty() || !merged.faceAlphas.empty();
-                    const bool needTextures =
-                        !part.faceTextures.empty() || !merged.faceTextures.empty();
-                    const bool needCoords =
-                        !part.textureCoords.empty() || !merged.textureCoords.empty();
-                    if (needTypes) merged.faceRenderTypes.resize(static_cast<size_t>(merged.faceCount), 0);
-                    if (needAlphas) merged.faceAlphas.resize(static_cast<size_t>(merged.faceCount), 0);
-                    if (needTextures) merged.faceTextures.resize(static_cast<size_t>(merged.faceCount), -1);
-                    if (needCoords) merged.textureCoords.resize(static_cast<size_t>(merged.faceCount), -1);
-                    for (int32_t f = 0; f < part.faceCount; ++f) {
-                        const size_t pf = static_cast<size_t>(f);
-                        merged.ia.push_back(part.ia[pf] + vertexBase);
-                        merged.ib.push_back(part.ib[pf] + vertexBase);
-                        merged.ic.push_back(part.ic[pf] + vertexBase);
-                        merged.faceColors.push_back(part.faceColors[pf]);
-                        if (needTypes) {
-                            merged.faceRenderTypes.push_back(
-                                part.faceRenderTypes.empty() ? 0 : part.faceRenderTypes[pf]);
-                        }
-                        if (needAlphas) {
-                            merged.faceAlphas.push_back(
-                                part.faceAlphas.empty() ? 0 : part.faceAlphas[pf]);
-                        }
-                        if (needTextures) {
-                            merged.faceTextures.push_back(
-                                part.faceTextures.empty() ? int16_t{-1} : part.faceTextures[pf]);
-                        }
-                        if (needCoords) {
-                            int8_t coord =
-                                part.textureCoords.empty() ? int8_t{-1} : part.textureCoords[pf];
-                            if (coord != -1) {
-                                // Coord indices are per-part; rebase them.
-                                const int32_t rebased = (coord & 0xff) + texBase;
-                                coord = rebased <= 127 ? static_cast<int8_t>(rebased)
-                                                       : int8_t{-1};
-                            }
-                            merged.textureCoords.push_back(coord);
-                        }
-                    }
-                    merged.faceCount += part.faceCount;
-                    // Texture-mapping triangles reference part-local vertices.
-                    for (int32_t t = 0; t < part.texTriangleCount; ++t) {
-                        const size_t pt = static_cast<size_t>(t);
-                        const bool valid = part.texP[pt] != 0xffff;
-                        merged.texP.push_back(valid ? static_cast<uint16_t>(part.texP[pt] + vertexBase) : uint16_t{0xffff});
-                        merged.texM.push_back(valid ? static_cast<uint16_t>(part.texM[pt] + vertexBase) : uint16_t{0xffff});
-                        merged.texN.push_back(valid ? static_cast<uint16_t>(part.texN[pt] + vertexBase) : uint16_t{0xffff});
-                    }
-                    merged.texTriangleCount += part.texTriangleCount;
-                } catch (const std::exception&) {
-                    ++skippedModels;
-                }
-            }
-
-            for (const auto& [from, to] : type.recolor) {
-                for (uint16_t& color : merged.faceColors) {
-                    if (color == from) color = to;
-                }
-            }
-            for (const auto& [from, to] : type.retexture) {
-                for (int16_t& texture : merged.faceTextures) {
-                    if (texture == static_cast<int16_t>(from)) {
-                        texture = static_cast<int16_t>(to);
-                    }
-                }
-            }
-
-            LitModel lit;
-            if (merged.faceCount > 0) {
-                lightModel(merged, 64 + type.ambient, 768 + type.contrast, textureInfo,
-                           lit);
-            }
-            litIt = litCache.emplace(cacheKey, std::move(lit)).first;
-        }
-        const LitModel& lit = litIt->second;
-        if (lit.positions.empty()) continue;
 
         // Placement transform: uniform per-axis scale, N x 90-degree yaw,
         // config offset, then translation to the loc's center on its tile.
@@ -2189,13 +2764,55 @@ bool WorldStreamer::Impl::buildSquare(int mapX, int mapY, Model& out) {
                                       -static_cast<float>(height + v.y) / kTileUnits,
                                       -static_cast<float>(baseUnitsZ + v.z) / kTileUnits);
         };
+        auto stamp = [&](Model& target, const LitModel& geometry) {
+            for (size_t f = 0; f + 2 < geometry.positions.size(); f += 3) {
+                emitTriangle(target, palette, transform(geometry.positions[f]),
+                             transform(geometry.positions[f + 1]),
+                             transform(geometry.positions[f + 2]), geometry.hsls[f],
+                             geometry.hsls[f + 1], geometry.hsls[f + 2],
+                             /*reorientUp=*/false, &geometry.uvs[f],
+                             geometry.layers[f / 3], geometry.alphas[f / 3]);
+            }
+        };
 
-        for (size_t f = 0; f + 2 < lit.positions.size(); f += 3) {
-            emitTriangle(model, palette, transform(lit.positions[f]),
-                         transform(lit.positions[f + 1]), transform(lit.positions[f + 2]),
-                         lit.hsls[f], lit.hsls[f + 1], lit.hsls[f + 2],
-                         /*reorientUp=*/false, &lit.uvs[f], lit.layers[f / 3]);
+        const int64_t cacheKey = static_cast<int64_t>(placement.id) * 64 + placement.shape;
+
+        // Animated locs: stamp every pre-built animation frame; placements
+        // of the same loc type in this square share one AnimatedGeometry
+        // (and therefore one timeline).
+        if (type.seqId != -1) {
+            const AnimEntry& anim = animEntry(cacheKey, *modelIds, type);
+            if (!anim.frames.empty()) {
+                auto [groupIt, inserted] =
+                    animGroups.try_emplace(cacheKey, animatedOut.size());
+                if (inserted) {
+                    animatedOut.emplace_back();
+                    animatedOut.back().frames.resize(anim.frames.size());
+                    animatedOut.back().frameLengthsMs = anim.frameLengthsMs;
+                }
+                AnimatedGeometry& group = animatedOut[groupIt->second];
+                for (size_t f = 0; f < anim.frames.size(); ++f) {
+                    stamp(group.frames[f], anim.frames[f]);
+                }
+                continue;
+            }
         }
+
+        // Static locs: decode + light once per (loc, shape), across all
+        // streamed squares.
+        auto litIt = litCache.find(cacheKey);
+        if (litIt == litCache.end()) {
+            RawModel merged;
+            LitModel lit;
+            if (buildMergedModel(*modelIds, type, merged)) {
+                lightModel(merged, 64 + type.ambient, 768 + type.contrast, textureInfo,
+                           lit);
+            }
+            litIt = litCache.emplace(cacheKey, std::move(lit)).first;
+        }
+        const LitModel& lit = litIt->second;
+        if (lit.positions.empty()) continue;
+        stamp(model, lit);
     }
 
     return true;
@@ -2212,6 +2829,7 @@ const std::vector<std::vector<uint8_t>>& WorldStreamer::textures() const {
     return impl_->textureLayers;
 }
 
-bool WorldStreamer::buildSquare(int mapX, int mapY, Model& out) {
-    return impl_->buildSquare(mapX, mapY, out);
+bool WorldStreamer::buildSquare(int mapX, int mapY, Model& out,
+                                std::vector<AnimatedGeometry>& animatedOut) {
+    return impl_->buildSquare(mapX, mapY, out, animatedOut);
 }

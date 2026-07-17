@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -308,6 +309,9 @@ Renderer::~Renderer() {
         if (vertexBuffer_ != VK_NULL_HANDLE) vkDestroyBuffer(device_, vertexBuffer_, nullptr);
         if (vertexMemory_ != VK_NULL_HANDLE) vkFreeMemory(device_, vertexMemory_, nullptr);
 
+        if (alphaPipeline_ != VK_NULL_HANDLE) {
+            vkDestroyPipeline(device_, alphaPipeline_, nullptr);
+        }
         if (pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(device_, pipeline_, nullptr);
         if (pipelineLayout_ != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
@@ -935,7 +939,7 @@ void Renderer::createGraphicsPipeline() {
     VkVertexInputAttributeDescription attributes[8]{};
     attributes[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, position)};
     attributes[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal)};
-    attributes[2] = {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, color)};
+    attributes[2] = {2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, color)};
     attributes[3] = {3, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, uvLayer)};
     for (uint32_t column = 0; column < 4; ++column) {
         attributes[4 + column] = {4 + column, 1, VK_FORMAT_R32G32B32A32_SFLOAT,
@@ -993,7 +997,8 @@ void Renderer::createGraphicsPipeline() {
     depthStencil.depthWriteEnable = VK_TRUE;
     depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
 
-    // Opaque geometry only: blending disabled, all channels written.
+    // Opaque pipeline: blending disabled, all channels written. (The alpha
+    // variant below flips this to standard over-blending.)
     VkPipelineColorBlendAttachmentState blendAttachment{};
     blendAttachment.colorWriteMask =
         VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -1044,7 +1049,25 @@ void Renderer::createGraphicsPipeline() {
                                       nullptr, &pipeline_),
             "vkCreateGraphicsPipelines");
 
-    // Modules are just SPIR-V containers; once the pipeline has consumed
+    // Second pipeline for the game's translucent faces (webs, waterfalls,
+    // portals): identical state except standard over-blending and depth
+    // writes OFF - translucent geometry tests against the opaque scene but
+    // never occludes it. In WebGL2 this was two gl.enable/gl.blendFunc
+    // calls flipped mid-frame; Vulkan bakes each combination into its own
+    // immutable pipeline and the frame switches between them with one bind.
+    blendAttachment.blendEnable = VK_TRUE;
+    blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+    blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+    depthStencil.depthWriteEnable = VK_FALSE;
+    vkCheck(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo,
+                                      nullptr, &alphaPipeline_),
+            "vkCreateGraphicsPipelines(alpha)");
+
+    // Modules are just SPIR-V containers; once the pipelines have consumed
     // them they can go.
     vkDestroyShaderModule(device_, fragModule, nullptr);
     vkDestroyShaderModule(device_, vertModule, nullptr);
@@ -1195,18 +1218,22 @@ void Renderer::createGeometryBuffers(const Model& model,
     if (instances.empty()) {
         throw std::runtime_error("instance data must not be empty");
     }
-    indexCount_ = static_cast<uint32_t>(model.indices.size());
+    opaqueIndexCount_ = static_cast<uint32_t>(model.indices.size());
+    indexCount_ = opaqueIndexCount_ + static_cast<uint32_t>(model.alphaIndices.size());
     instanceCapacity_ = static_cast<uint32_t>(instances.size());
 
-    // An empty base model is legal: world mode streams all of its geometry
+    // An empty base model is legal: the world streams all of its geometry
     // in as chunks at runtime and starts with nothing resident.
     if (indexCount_ > 0) {
         createDeviceLocalBuffer(model.vertices.data(),
                                 model.vertices.size() * sizeof(Vertex),
                                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertexBuffer_,
                                 vertexMemory_);
-        createDeviceLocalBuffer(model.indices.data(),
-                                model.indices.size() * sizeof(uint32_t),
+        // One index buffer, opaque range first, translucent range appended.
+        std::vector<uint32_t> combined = model.indices;
+        combined.insert(combined.end(), model.alphaIndices.begin(),
+                        model.alphaIndices.end());
+        createDeviceLocalBuffer(combined.data(), combined.size() * sizeof(uint32_t),
                                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indexBuffer_,
                                 indexMemory_);
     }
@@ -1496,34 +1523,52 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex,
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1,
                             &descriptorSets_[currentFrame_], 0, nullptr);
 
+    // Defensive clamp: drawing past the end of the instance buffer is
+    // undefined behavior no layer can reliably catch (the GPU would fetch
+    // garbage transforms).
+    const uint32_t firstInstance = std::min(input.firstInstance, instanceCapacity_ - 1);
+    const uint32_t instanceCount =
+        std::min(input.instanceCount, instanceCapacity_ - firstInstance);
+
+    // Pass 1, opaque: everything that writes depth. Animated chunks bind
+    // whichever pre-built frame the wall clock selects - the animation is a
+    // different index/vertex binding, never an upload.
     const VkDeviceSize offsets[] = {0, 0};
-    if (indexCount_ > 0) {
+    if (opaqueIndexCount_ > 0) {
         const VkBuffer vertexBuffers[] = {vertexBuffer_, instanceBuffer_};
         vkCmdBindVertexBuffers(cmd, 0, 2, vertexBuffers, offsets);
         vkCmdBindIndexBuffer(cmd, indexBuffer_, 0, VK_INDEX_TYPE_UINT32);
-
-        // Defensive clamp: drawing past the end of the instance buffer is
-        // undefined behavior no layer can reliably catch (the GPU would
-        // fetch garbage transforms).
-        const uint32_t firstInstance = std::min(input.firstInstance, instanceCapacity_ - 1);
-        const uint32_t instanceCount =
-            std::min(input.instanceCount, instanceCapacity_ - firstInstance);
-
-        // The one draw call. Whether this renders 1 tree or the whole N x N
-        // grid, the CPU cost is identical - the instance count is just a
-        // number in the command; the GPU steps binding 1 once per instance.
-        // That is the entire thesis of instancing: per-frame cost scales
-        // with unique geometry, not with how many copies of it you draw.
-        vkCmdDrawIndexed(cmd, indexCount_, instanceCount, 0, 0, firstInstance);
+        vkCmdDrawIndexed(cmd, opaqueIndexCount_, instanceCount, 0, 0, firstInstance);
+    }
+    for (const Chunk& chunk : chunks_) {
+        const ChunkFrame& frame = chunkFrameAt(chunk, input.timeMs);
+        if (frame.opaqueIndexCount == 0) continue;
+        const VkBuffer vertexBuffers[] = {frame.vertexBuffer, instanceBuffer_};
+        vkCmdBindVertexBuffers(cmd, 0, 2, vertexBuffers, offsets);
+        vkCmdBindIndexBuffer(cmd, frame.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, frame.opaqueIndexCount, 1, 0, 0, 0);
     }
 
-    // Streamed world chunks: same pipeline and descriptors, one identity
-    // instance each; only the vertex/index bindings change per chunk.
-    for (const Chunk& chunk : chunks_) {
-        const VkBuffer vertexBuffers[] = {chunk.vertexBuffer, instanceBuffer_};
+    // Pass 2, translucent: blending on, depth writes off, drawn after the
+    // whole opaque scene so webs and waterfalls composite over it. Faces
+    // are not sorted among themselves - acceptable for the game's sparse
+    // translucent geometry (the client sorts per face; a noted tradeoff).
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, alphaPipeline_);
+    if (indexCount_ > opaqueIndexCount_) {
+        const VkBuffer vertexBuffers[] = {vertexBuffer_, instanceBuffer_};
         vkCmdBindVertexBuffers(cmd, 0, 2, vertexBuffers, offsets);
-        vkCmdBindIndexBuffer(cmd, chunk.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(cmd, chunk.indexCount, 1, 0, 0, 0);
+        vkCmdBindIndexBuffer(cmd, indexBuffer_, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, indexCount_ - opaqueIndexCount_, instanceCount,
+                         opaqueIndexCount_, 0, firstInstance);
+    }
+    for (const Chunk& chunk : chunks_) {
+        const ChunkFrame& frame = chunkFrameAt(chunk, input.timeMs);
+        if (frame.indexCount == frame.opaqueIndexCount) continue;
+        const VkBuffer vertexBuffers[] = {frame.vertexBuffer, instanceBuffer_};
+        vkCmdBindVertexBuffers(cmd, 0, 2, vertexBuffers, offsets);
+        vkCmdBindIndexBuffer(cmd, frame.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, frame.indexCount - frame.opaqueIndexCount, 1,
+                         frame.opaqueIndexCount, 0, 0);
     }
 
     vkCmdEndRenderPass(cmd);
@@ -1569,19 +1614,60 @@ void Renderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex,
     vkCheck(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 }
 
+Renderer::ChunkFrame Renderer::uploadChunkFrame(const Model& model) {
+    ChunkFrame frame;
+    frame.opaqueIndexCount = static_cast<uint32_t>(model.indices.size());
+    frame.indexCount =
+        frame.opaqueIndexCount + static_cast<uint32_t>(model.alphaIndices.size());
+    createDeviceLocalBuffer(model.vertices.data(), model.vertices.size() * sizeof(Vertex),
+                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, frame.vertexBuffer,
+                            frame.vertexMemory);
+    std::vector<uint32_t> combined = model.indices;
+    combined.insert(combined.end(), model.alphaIndices.begin(), model.alphaIndices.end());
+    createDeviceLocalBuffer(combined.data(), combined.size() * sizeof(uint32_t),
+                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT, frame.indexBuffer,
+                            frame.indexMemory);
+    return frame;
+}
+
 uint64_t Renderer::addChunkGeometry(const Model& model) {
-    if (model.vertices.empty() || model.indices.empty()) return 0;
+    if (model.vertices.empty() || (model.indices.empty() && model.alphaIndices.empty())) {
+        return 0;
+    }
     Chunk chunk;
     chunk.id = nextChunkId_++;
-    chunk.indexCount = static_cast<uint32_t>(model.indices.size());
-    createDeviceLocalBuffer(model.vertices.data(), model.vertices.size() * sizeof(Vertex),
-                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, chunk.vertexBuffer,
-                            chunk.vertexMemory);
-    createDeviceLocalBuffer(model.indices.data(), model.indices.size() * sizeof(uint32_t),
-                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT, chunk.indexBuffer,
-                            chunk.indexMemory);
-    chunks_.push_back(chunk);
-    return chunk.id;
+    chunk.frames.push_back(uploadChunkFrame(model));
+    chunks_.push_back(std::move(chunk));
+    return chunks_.back().id;
+}
+
+uint64_t Renderer::addAnimatedChunkGeometry(const std::vector<Model>& frames,
+                                            const std::vector<uint32_t>& frameLengthsMs) {
+    if (frames.empty() || frames.size() != frameLengthsMs.size()) return 0;
+    Chunk chunk;
+    chunk.id = nextChunkId_++;
+    uint32_t elapsed = 0;
+    for (size_t i = 0; i < frames.size(); ++i) {
+        chunk.frames.push_back(uploadChunkFrame(frames[i]));
+        elapsed += std::max<uint32_t>(frameLengthsMs[i], 1);
+        chunk.frameEndMs.push_back(elapsed);
+    }
+    chunk.totalDurationMs = elapsed;
+    chunks_.push_back(std::move(chunk));
+    return chunks_.back().id;
+}
+
+const Renderer::ChunkFrame& Renderer::chunkFrameAt(const Chunk& chunk,
+                                                   double timeMs) const {
+    if (chunk.frames.size() == 1 || chunk.totalDurationMs == 0) {
+        return chunk.frames[0];
+    }
+    const auto t = static_cast<uint32_t>(
+        std::fmod(std::max(timeMs, 0.0), static_cast<double>(chunk.totalDurationMs)));
+    for (size_t i = 0; i < chunk.frameEndMs.size(); ++i) {
+        if (t < chunk.frameEndMs[i]) return chunk.frames[i];
+    }
+    return chunk.frames.back();
 }
 
 void Renderer::removeChunkGeometry(uint64_t handle) {
@@ -1589,7 +1675,7 @@ void Renderer::removeChunkGeometry(uint64_t handle) {
     for (size_t i = 0; i < chunks_.size(); ++i) {
         if (chunks_[i].id == handle) {
             chunks_[i].retiredAtFrame = absoluteFrame_;
-            retiredChunks_.push_back(chunks_[i]);
+            retiredChunks_.push_back(std::move(chunks_[i]));
             chunks_.erase(chunks_.begin() + static_cast<ptrdiff_t>(i));
             return;
         }
@@ -1597,10 +1683,12 @@ void Renderer::removeChunkGeometry(uint64_t handle) {
 }
 
 void Renderer::destroyChunk(Chunk& chunk) {
-    vkDestroyBuffer(device_, chunk.vertexBuffer, nullptr);
-    vkFreeMemory(device_, chunk.vertexMemory, nullptr);
-    vkDestroyBuffer(device_, chunk.indexBuffer, nullptr);
-    vkFreeMemory(device_, chunk.indexMemory, nullptr);
+    for (ChunkFrame& frame : chunk.frames) {
+        vkDestroyBuffer(device_, frame.vertexBuffer, nullptr);
+        vkFreeMemory(device_, frame.vertexMemory, nullptr);
+        vkDestroyBuffer(device_, frame.indexBuffer, nullptr);
+        vkFreeMemory(device_, frame.indexMemory, nullptr);
+    }
 }
 
 bool Renderer::drawFrame(const FrameInput& input) {

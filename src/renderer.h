@@ -30,6 +30,8 @@ struct FrameInput {
     glm::mat4 proj;
     uint32_t instanceCount = 1;
     uint32_t firstInstance = 0;
+    // Wall-clock milliseconds; drives which frame animated chunks display.
+    double timeMs = 0.0;
     // Lighting terms for the Gouraud vertex shader. World-terrain mode sets
     // (1, 0): the cache pipeline bakes its hillshade lighting into the vertex
     // colors, so the shader must pass them through unmodified.
@@ -70,6 +72,13 @@ public:
     // the same pipeline (instance 0's identity transform). Returns 0 for an
     // empty model, otherwise a handle for removeChunkGeometry.
     uint64_t addChunkGeometry(const Model& model);
+    // An animated chunk carries one geometry set per animation frame plus
+    // per-frame display durations (milliseconds); drawFrame picks the frame
+    // from FrameInput::timeMs. All frames are resident on the GPU - the
+    // animation costs zero uploads at runtime, just a different index
+    // buffer binding per draw.
+    uint64_t addAnimatedChunkGeometry(const std::vector<Model>& frames,
+                                      const std::vector<uint32_t>& frameLengthsMs);
     // Removal is deferred until the frames that may still reference the
     // buffers have finished (see the retired list in drawFrame) - the GPU
     // owns buffers long after the CPU stops mentioning them.
@@ -183,6 +192,9 @@ private:
     VkDescriptorSetLayout descriptorSetLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+    // Same state as pipeline_ except blending on and depth writes off;
+    // draws every chunk's translucent index range after the opaque pass.
+    VkPipeline alphaPipeline_ = VK_NULL_HANDLE;
 
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
 
@@ -196,7 +208,8 @@ private:
     VkDeviceMemory vertexMemory_ = VK_NULL_HANDLE;
     VkBuffer indexBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory indexMemory_ = VK_NULL_HANDLE;
-    uint32_t indexCount_ = 0;
+    uint32_t indexCount_ = 0;       // total: opaque + translucent
+    uint32_t opaqueIndexCount_ = 0; // leading opaque range of the index buffer
     VkBuffer instanceBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory instanceMemory_ = VK_NULL_HANDLE;
     uint32_t instanceCapacity_ = 0;
@@ -223,19 +236,31 @@ private:
     uint64_t absoluteFrame_ = 0;
     bool framebufferResized_ = false;
 
-    struct Chunk {
-        uint64_t id = 0;
+    // One geometry set. A static chunk has exactly one; an animated chunk
+    // has one per animation frame. The index buffer packs the opaque range
+    // first, then the translucent range.
+    struct ChunkFrame {
         VkBuffer vertexBuffer = VK_NULL_HANDLE;
         VkDeviceMemory vertexMemory = VK_NULL_HANDLE;
         VkBuffer indexBuffer = VK_NULL_HANDLE;
         VkDeviceMemory indexMemory = VK_NULL_HANDLE;
         uint32_t indexCount = 0;
+        uint32_t opaqueIndexCount = 0;
+    };
+    struct Chunk {
+        uint64_t id = 0;
+        std::vector<ChunkFrame> frames;
+        // Cumulative end time of each frame in ms (empty for static chunks).
+        std::vector<uint32_t> frameEndMs;
+        uint32_t totalDurationMs = 0;
         uint64_t retiredAtFrame = 0;
     };
     std::vector<Chunk> chunks_;
     std::vector<Chunk> retiredChunks_;
     uint64_t nextChunkId_ = 1;
     void destroyChunk(Chunk& chunk);
+    ChunkFrame uploadChunkFrame(const Model& model);
+    const ChunkFrame& chunkFrameAt(const Chunk& chunk, double timeMs) const;
 
     VkBuffer screenshotBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory screenshotMemory_ = VK_NULL_HANDLE;

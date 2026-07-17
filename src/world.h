@@ -26,6 +26,15 @@
 
 #include "model.h"
 
+// Geometry for one group of animated locs (all placements of one loc type
+// within a square share a timeline): one pre-built Model per animation
+// frame plus each frame's display duration. The renderer keeps every frame
+// resident and switches between them by time.
+struct AnimatedGeometry {
+    std::vector<Model> frames;
+    std::vector<uint32_t> frameLengthsMs;
+};
+
 class WorldStreamer {
 public:
     WorldStreamer();
@@ -41,8 +50,11 @@ public:
     const std::vector<std::vector<uint8_t>>& textures() const;
 
     // Builds one map square's terrain + scenery. Returns false if the cache
-    // has no data for that square (open sea, unreleased areas).
-    bool buildSquare(int mapX, int mapY, Model& out);
+    // has no data for that square (open sea, unreleased areas). Locs whose
+    // config names an animation come back in `animatedOut` (grouped by loc
+    // type) instead of being baked into the static model.
+    bool buildSquare(int mapX, int mapY, Model& out,
+                     std::vector<AnimatedGeometry>& animatedOut);
 
 private:
     struct Impl;

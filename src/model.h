@@ -20,7 +20,9 @@
 struct Vertex {
     glm::vec3 position;
     glm::vec3 normal;
-    glm::vec3 color;
+    // RGB color plus opacity: 1 = opaque, lower values are the game's
+    // per-face translucency (spider webs, waterfalls, portals).
+    glm::vec4 color;
     // Texture coordinates + array layer for textured faces. z < 0 means
     // untextured: the fragment shader uses the vertex color alone.
     glm::vec3 uvLayer{0.0f, 0.0f, -1.0f};
@@ -32,7 +34,12 @@ struct Vertex {
 // Flat-shaded faces duplicate their three vertices so each corner can carry
 // the face normal and face color; smooth (Gouraud) faces share vertices
 // through the index buffer. OSRS models mix both per face.
+//
+// Translucent faces go into a separate index list over the same vertex
+// array: the renderer draws `indices` with the opaque pipeline first, then
+// `alphaIndices` with blending on and depth writes off.
 struct Model {
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
+    std::vector<uint32_t> alphaIndices;
 };

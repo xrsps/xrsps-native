@@ -28,6 +28,15 @@ concept.
   (Gouraud) - the OSRS look.
 - Per-frame-in-flight uniform buffers (persistently mapped) fed by an
   orbit camera.
+- Translucent scenery (spider webs, waterfalls, portals): the models'
+  per-face alpha feeds a second pipeline with blending on and depth writes
+  off, drawn after the opaque pass.
+- Animated scenery (fires, flags, water wheels): a port of the game's
+  seq/frame/framemap animation stack, applied with the client's exact
+  fixed-point transforms. Every animation frame is pre-built into its own
+  vertex/index buffers when a map square loads, so at draw time an
+  animation is just a different buffer binding picked by the wall clock -
+  zero uploads per frame.
 - Screenshot capture (`F2`, or `--screenshot` for scripted runs) by copying
   the swapchain image into a host-visible buffer.
 
@@ -37,8 +46,9 @@ concept.
   a from-scratch C++ port of the cache stack: sector
   store, gzip/bzip2 containers, XTEA, reference tables, map decoding,
   underlay blending, tile shapes, the game's HSL palette and integer
-  hillshade lighting, loc configs, the classic/V2/V3 model formats with
-  per-vertex Gouraud lighting, and sampled game textures (sprites decoded
+  hillshade lighting, loc configs, seq/frame/framemap animation data, the
+  classic/V2/V3 model formats with per-vertex Gouraud lighting, and
+  sampled game textures (sprites decoded
   into a texture array; leaves and fences use alpha cutout) - producing a
   scene that matches the game. Map squares stream in and out around the
   camera as you fly (WASD / RMB-drag), so the whole world map is reachable;
@@ -47,8 +57,8 @@ concept.
   neighbours as decode context, which keeps color blending and lighting
   seamless across chunk borders.
 
-Non-goals, kept out deliberately: animation, multiple pipelines, shadow
-mapping.
+Non-goals, kept out deliberately: NPCs and players, per-face depth sorting
+of translucent geometry, shadow mapping.
 
 ## Controls
 
@@ -158,10 +168,12 @@ as two sets of per-frame resources and one `vkWaitForFences` at the top of
 
 | File               | Contents                                                        |
 | ------------------ | --------------------------------------------------------------- |
-| `src/main.cpp`     | Window, input callbacks, frame loop, CLI flags, self-test       |
+| `src/main.cpp`     | Window, input callbacks, frame loop, chunk streaming, CLI flags, self-test |
 | `src/renderer.h/.cpp` | All Vulkan: init chain, swapchain lifecycle, frame path, screenshot, buffer helpers |
 | `src/camera.h/.cpp` | Orbit camera; owns the Vulkan clip-space corrections           |
-| `src/model.h/.cpp` | `Model`/`Vertex` contract, `loadModel()` integration point, procedural tree |
+| `src/model.h`      | The `Model`/`Vertex` contract between world building and the renderer |
+| `src/cache.h/.cpp` | JS5 cache reader: sector store, gzip/bzip2 containers, XTEA, reference tables |
+| `src/world.h/.cpp` | Map/terrain decoding, loc models + animation, palette + hillshade lighting, chunk building |
 | `shaders/model.vert/.frag` | Gouraud lighting; compiled to SPIR-V by CMake           |
 
 ## License

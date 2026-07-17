@@ -26,7 +26,8 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
 // Per-vertex attributes (binding 0, VK_VERTEX_INPUT_RATE_VERTEX).
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
-layout(location = 2) in vec3 inColor;
+// RGB + opacity; the alpha channel passes through lighting untouched.
+layout(location = 2) in vec4 inColor;
 // Texture coordinates + array layer; layer < 0 means untextured.
 layout(location = 3) in vec3 inUvLayer;
 
@@ -35,7 +36,7 @@ layout(location = 3) in vec3 inUvLayer;
 // C++ side declares it as four vec4 columns.
 layout(location = 4) in mat4 inModel;
 
-layout(location = 0) out vec3 vColor;
+layout(location = 0) out vec4 vColor;
 layout(location = 1) out vec3 vUvLayer;
 
 void main() {
@@ -56,7 +57,7 @@ void main() {
 
     // Clamp per vertex, before interpolation, so overbright faces saturate
     // uniformly instead of skewing the gradient across the triangle.
-    vColor = min(inColor * brightness, vec3(1.0));
+    vColor = vec4(min(inColor.rgb * brightness, vec3(1.0)), inColor.a);
     // The layer is constant across a face, so interpolation is a no-op.
     vUvLayer = inUvLayer;
 

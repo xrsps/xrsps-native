@@ -16,8 +16,6 @@
 
 #include <GLFW/glfw3.h>
 
-#include <glm/gtc/matrix_transform.hpp>
-
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -282,8 +280,13 @@ int main(int argc, char** argv) {
         Renderer renderer(window, model, instances, streamer.textures());
         app.renderer = &renderer;
 
-        // Streamed squares: key -> chunk handle (0 = square known absent).
-        std::unordered_map<int64_t, uint64_t> loadedSquares;
+        // Streamed squares: key -> chunk handles (terrain plus one animated
+        // chunk per animated loc group; all zero/empty = square known absent).
+        struct SquareChunks {
+            uint64_t terrain = 0;
+            std::vector<uint64_t> animated;
+        };
+        std::unordered_map<int64_t, SquareChunks> loadedSquares;
         auto squareKey = [](int mx, int my) {
             return (static_cast<int64_t>(mx) << 32) |
                    static_cast<uint32_t>(static_cast<int32_t>(my));
@@ -330,7 +333,10 @@ int main(int argc, char** argv) {
                 const int my = static_cast<int32_t>(it->first & 0xffffffff);
                 if (std::abs(mx - centerX) > radius + 1 ||
                     std::abs(my - centerY) > radius + 1) {
-                    renderer.removeChunkGeometry(it->second);
+                    renderer.removeChunkGeometry(it->second.terrain);
+                    for (const uint64_t handle : it->second.animated) {
+                        renderer.removeChunkGeometry(handle);
+                    }
                     it = loadedSquares.erase(it);
                 } else {
                     ++it;
@@ -354,11 +360,17 @@ int main(int argc, char** argv) {
             }
             if (bestDistance != INT_MAX) {
                 Model chunk;
-                uint64_t handle = 0;
-                if (streamer.buildSquare(bestX, bestY, chunk)) {
-                    handle = renderer.addChunkGeometry(chunk);
+                std::vector<AnimatedGeometry> animated;
+                SquareChunks handles;
+                if (streamer.buildSquare(bestX, bestY, chunk, animated)) {
+                    handles.terrain = renderer.addChunkGeometry(chunk);
+                    for (const AnimatedGeometry& group : animated) {
+                        const uint64_t handle = renderer.addAnimatedChunkGeometry(
+                            group.frames, group.frameLengthsMs);
+                        if (handle != 0) handles.animated.push_back(handle);
+                    }
                 }
-                loadedSquares.emplace(squareKey(bestX, bestY), handle);
+                loadedSquares.emplace(squareKey(bestX, bestY), std::move(handles));
             }
 
             if (options.selfTest) runSelfTestStep(window, app, frameNumber);
@@ -382,6 +394,7 @@ int main(int argc, char** argv) {
             FrameInput input{};
             input.view = app.camera.viewMatrix();
             input.proj = app.camera.projectionMatrix(aspect);
+            input.timeMs = glfwGetTime() * 1000.0; // drives loc animations
             input.instanceCount = 1; // instance 0: the identity transform
             input.firstInstance = 0;
             // World colors already contain the game's baked hillshade;
