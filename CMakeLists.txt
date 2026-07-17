@@ -1,4 +1,4 @@
-# xrsps-native: OSRS-style model viewer in C++/Vulkan.
+# xrsps-native: OSRS world viewer in C++/Vulkan.
 #
 # The build intentionally avoids renderer frameworks and helper libraries
 # (no vk-bootstrap, no VMA): the point of the project is that every Vulkan
@@ -8,7 +8,7 @@ cmake_minimum_required(VERSION 3.21)
 
 project(xrsps-native
     VERSION 0.1.0
-    DESCRIPTION "OSRS-style model viewer in C++/Vulkan"
+    DESCRIPTION "OSRS world viewer in C++/Vulkan"
     # C is only needed when the zlib/bzip2 fallbacks below build from source.
     LANGUAGES C CXX)
 
@@ -60,7 +60,7 @@ if(NOT TARGET glm::glm)
     add_library(glm::glm ALIAS glm)
 endif()
 
-# zlib and bzip2 decompress the JS5 cache containers used by --world. Both
+# zlib and bzip2 decompress the JS5 cache containers. Both
 # are a handful of C files with no configure step, so when no system package
 # exists the pristine upstream sources are downloaded and built as small
 # static libraries right here - deliberately not vendored into the repo.
@@ -127,7 +127,6 @@ add_executable(xrsps-native
     src/main.cpp
     src/renderer.cpp
     src/camera.cpp
-    src/model.cpp
     src/cache.cpp
     src/world.cpp)
 

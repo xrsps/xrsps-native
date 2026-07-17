@@ -1,10 +1,11 @@
 # xrsps-native
 
-A single-window C++20 / Vulkan 1.3 model viewer that renders low-poly
-models with OSRS-style per-vertex (Gouraud) lighting - a native port of a
-vertical slice of [XRSPS](https://github.com/xrsps/xrsps-typescript), my
-from-scratch browser recreation of Old School RuneScape with a custom WebGL2
-renderer written in TypeScript.
+A single-window C++20 / Vulkan 1.3 viewer that streams and renders the Old
+School RuneScape game world with its per-vertex (Gouraud) lighting - a
+native port of a vertical slice of
+[XRSPS](https://github.com/xrsps/xrsps-typescript), my from-scratch browser
+recreation of Old School RuneScape with a custom WebGL2 renderer written in
+TypeScript.
 
 The point of the project is the translation: the same rendering concepts my
 WebGL2 renderer implements, re-expressed against an explicit modern API with
@@ -22,26 +23,18 @@ concept.
   synchronization with two frames in flight (semaphores + fences).
 - Vertex/index/instance buffers uploaded to device-local memory through
   staging buffers with a one-shot transfer command buffer.
-- GLSL compiled to SPIR-V at build time (glslc); lighting evaluated in
-  the vertex shader and interpolated (Gouraud), flat ambient + one
-  directional light, vertex colors, no textures - the OSRS look.
+- GLSL compiled to SPIR-V at build time (glslc); per-vertex colors carry
+  the game's baked hillshade lighting and are interpolated across faces
+  (Gouraud) - the OSRS look.
 - Per-frame-in-flight uniform buffers (persistently mapped) fed by an
   orbit camera.
-- Instanced rendering mode: a keyboard toggle draws a 12x12 grid of the
-  model via per-instance `mat4` transforms in a second vertex buffer -
-  demonstrating that per-frame cost scales with unique geometry, not
-  instance count (watch the title-bar frame time).
-- Built-in procedurally generated placeholder model (a low-poly tree), so
-  the project runs with zero assets. `loadModel()` in `src/model.h` is
-  the documented integration point where an OSRS cache-format decoder plugs
-  in.
 - Screenshot capture (`F2`, or `--screenshot` for scripted runs) by copying
   the swapchain image into a host-visible buffer.
 
-- World mode (`--world`): loads a real OSRS cache dump (JS5
-  `main_file_cache.dat2` + `.idx` files, e.g. from an OpenRS2 archive placed
-  in `cache/` - game assets are never committed) and renders actual game
-  terrain plus scenery. A from-scratch C++ port of the cache stack: sector
+- The world comes from a real OSRS cache dump (JS5 `main_file_cache.dat2`
+  + `.idx` files, e.g. from an OpenRS2 archive, placed in `cache/` - game
+  assets are never committed): actual game terrain plus scenery, decoded by
+  a from-scratch C++ port of the cache stack: sector
   store, gzip/bzip2 containers, XTEA, reference tables, map decoding,
   underlay blending, tile shapes, the game's HSL palette and integer
   hillshade lighting, loc configs, the classic/V2/V3 model formats with
@@ -63,17 +56,16 @@ mapping.
 | -------------- | ---------------------------------------- |
 | Drag LMB       | Orbit the camera                         |
 | Drag RMB       | Pan across the ground plane              |
-| `WASD`         | Fly across the world (world mode)        |
+| `WASD`         | Fly across the world                     |
 | Scroll wheel   | Zoom                                     |
-| `I`            | Toggle the 12x12 instanced grid          |
 | `F2`           | Save `screenshot.ppm`                    |
 | `ESC`          | Quit                                     |
 
-CLI flags (all optional): `--instanced`, `--screenshot <path>`,
-`--frames <n>`, `--yaw <deg>`, `--pitch <deg>`, `--dist <units>`, and
-`--self-test` (scripted resize/minimize/restore/instancing/screenshot run
-whose exit code reflects the validation-layer message count - the CI
-version of "runs clean").
+CLI flags (all optional): `--screenshot <path>`, `--frames <n>`,
+`--yaw <deg>`, `--pitch <deg>`, `--dist <units>`, `--cache <dir>`,
+`--map <mx,my>`, `--radius <n>`, and `--self-test` (scripted
+resize/minimize/restore/screenshot run whose exit code reflects the
+validation-layer message count - the CI version of "runs clean").
 
 ## Building
 
@@ -105,7 +97,7 @@ build-win\Release\xrsps-native.exe
 (Use `--config Debug` to run with the validation layers enabled.)
 
 `build_win.bat` does the same in one step and launches the viewer;
-arguments are passed through, e.g. `build_win.bat --world`.
+arguments are passed through, e.g. `build_win.bat --radius 3`.
 
 ### Linux
 

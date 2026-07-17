@@ -21,9 +21,8 @@ struct Vertex {
     glm::vec3 position;
     glm::vec3 normal;
     glm::vec3 color;
-    // Texture coordinates + array layer for textured faces (world mode).
-    // z < 0 means untextured: the fragment shader uses the vertex color
-    // alone, so models with no textures (like the placeholder) ignore this.
+    // Texture coordinates + array layer for textured faces. z < 0 means
+    // untextured: the fragment shader uses the vertex color alone.
     glm::vec3 uvLayer{0.0f, 0.0f, -1.0f};
 };
 
@@ -32,28 +31,8 @@ struct Vertex {
 //
 // Flat-shaded faces duplicate their three vertices so each corner can carry
 // the face normal and face color; smooth (Gouraud) faces share vertices
-// through the index buffer. OSRS models mix both per face, which is why the
-// interface is indexed even though the procedural placeholder below happens
-// to be fully flat-shaded.
+// through the index buffer. OSRS models mix both per face.
 struct Model {
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
 };
-
-// ---------------------------------------------------------------------------
-// INTEGRATION POINT for a real OSRS model decoder.
-//
-// The renderer is completely agnostic about where the model comes from; it
-// only sees the Model struct above. To display real cache models, replace
-// the body of loadModel() with a decoder that fills in the same contract:
-//
-//   - triangle list, CCW winding when viewed from outside
-//   - +Y up, ground plane at y = 0, roughly 1 unit ~ 1 game "tile-ish" meter
-//   - colors as linear RGB (OSRS's 16-bit HSL palette entries converted)
-//   - flat faces: duplicate vertices with the face normal
-//   - smooth faces: shared vertices with area-weighted vertex normals
-//
-// The built-in placeholder is a procedurally generated low-poly tree so the
-// project runs with zero assets.
-// ---------------------------------------------------------------------------
-Model loadModel();
